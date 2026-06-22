@@ -4,7 +4,6 @@
 [![Ollama](https://img.shields.io/badge/LLM-Ollama-000000?style=for-the-badge&logo=ollama&logoColor=white)](https://ollama.com)
 [![Architecture](https://img.shields.io/badge/Architecture-Orchestrator%20%2F%20Subprocess-00D4FF?style=for-the-badge)](#-архитектура)
 [![Protocol](https://img.shields.io/badge/Protocol-JSON%20over%20stdio-39FF14?style=for-the-badge)](#-протокол-общения-ядра-с-агентом)
-[![Status](https://img.shields.io/badge/Status-Учебный%20проект-FFD700?style=for-the-badge)](#)
 
 **MCP Server** — ядро оркестратора для запуска и координации ИИ-агентов, построенное на чистом **Python 3.10+** без сторонних фреймворков. Каждый агент работает как независимый подпроцесс, общающийся с ядром по простому JSON-протоколу через stdin/stdout. Ядро хранит общую память агентов и умеет обращаться к локальной LLM через **Ollama REST API**.
 
