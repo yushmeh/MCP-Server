@@ -1,0 +1,16 @@
+{
+  "ollama": {
+    "host": "http://localhost:11434",
+    "default_model": "llama3"
+  },
+  "agents": {
+    "test_agent": {
+      "script": "agents/test_agent.py",
+      "role": "stub",
+      "enabled": true
+    }
+  },
+  "orchestrator": {
+    "agent_response_timeout_seconds": 15
+  }
+}
