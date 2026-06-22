@@ -164,7 +164,7 @@ mcp_server/
 
 ```bash
 git clone https://github.com/yushmeh/MCP-Server
-cd mcp_server
+cd MCPServer
 pip install -r requirements.txt
 ```
 
