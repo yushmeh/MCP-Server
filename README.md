@@ -163,7 +163,7 @@ mcp_server/
 ## ⚙️ Установка
 
 ```bash
-git clone <ссылка-на-репозиторий>
+git clone [<ссылка-на-репозиторий>](https://github.com/yushmeh/MCP-Server)
 cd mcp_server
 pip install -r requirements.txt
 ```
