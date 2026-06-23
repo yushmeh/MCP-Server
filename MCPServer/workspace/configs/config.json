@@ -1,16 +1,21 @@
 {
   "ollama": {
     "host": "http://localhost:11434",
-    "default_model": "llama3"
+    "default_model": "qwen2.5-coder:3b"
   },
   "agents": {
     "test_agent": {
       "script": "agents/test_agent.py",
       "role": "stub",
       "enabled": true
+    },
+    "analyst": {
+      "script": "agents/analyst.py",
+      "role": "analyst",
+      "enabled": true
     }
   },
   "orchestrator": {
-    "agent_response_timeout_seconds": 15
+    "agent_response_timeout_seconds": 120
   }
 }

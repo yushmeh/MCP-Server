@@ -1,16 +1,3 @@
-"""
-Orchestrator — ядро MCP сервера.
-
-Отвечает за:
-- запуск ИИ-агентов как отдельных подпроцессов (каждый агент — обычный
-  python-скрипт, общающийся с ядром через stdin/stdout по протоколу
-  "одна JSON-строка = одно сообщение");
-- хранение общей памяти агентов (shared memory) в оперативной памяти
-  процесса с автосохранением на диск в workspace/memory.json;
-- прием ввода от пользователя и передачу его первому агенту в цепочке;
-- общение с локальной Ollama через REST API (http://localhost:11434).
-"""
-
 from __future__ import annotations
 
 import json
@@ -19,21 +6,17 @@ import queue
 import subprocess
 import sys
 import threading
-import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
 import requests
 
+from core.parser import validate_llm_response
+
 
 class AgentHandle:
-    """Обёртка над подпроцессом одного агента.
-
-    Хранит сам Popen-объект, очередь прочитанных строк stdout
-    и фоновый поток, который их туда складывает (чтобы read()
-    не блокировал оркестратор).
-    """
+    """Обёртка над подпроцессом одного агента."""
 
     def __init__(self, name: str, process: subprocess.Popen):
         self.name = name
@@ -44,6 +27,14 @@ class AgentHandle:
         )
         self._reader_thread.start()
 
+        # stderr агента раньше просто терялся в трубе — теперь печатаем
+        # его в консоль ядра с префиксом, чтобы видеть ошибки/диагностику
+        # из самого агента (например, причину отказа Ollama).
+        self._stderr_thread = threading.Thread(
+            target=self._read_stderr, daemon=True
+        )
+        self._stderr_thread.start()
+
     def _read_stdout(self) -> None:
         # Построчно читаем stdout агента и кладём в очередь,
         # пока процесс жив.
@@ -52,6 +43,15 @@ class AgentHandle:
             line = line.rstrip("\n")
             if line:
                 self.stdout_queue.put(line)
+
+    def _read_stderr(self) -> None:
+        # Построчно читаем stderr агента и сразу печатаем в консоль ядра.
+        if self.process.stderr is None:
+            return
+        for line in self.process.stderr:
+            line = line.rstrip("\n")
+            if line:
+                print(f"[agent:{self.name}][stderr] {line}", file=sys.stderr, flush=True)
 
     def is_alive(self) -> bool:
         return self.process.poll() is None
@@ -111,9 +111,6 @@ class Orchestrator:
         self.logger.info("Orchestrator инициализирован. workspace=%s logs=%s",
                           self.workspace_dir, self.logs_dir)
 
-    # ------------------------------------------------------------------ #
-    # Логирование
-    # ------------------------------------------------------------------ #
     def _setup_logging(self) -> logging.Logger:
         logger = logging.getLogger("mcp_orchestrator")
         logger.setLevel(logging.DEBUG)
@@ -135,9 +132,6 @@ class Orchestrator:
         logger.addHandler(console_handler)
         return logger
 
-    # ------------------------------------------------------------------ #
-    # Общая память агентов
-    # ------------------------------------------------------------------ #
     def _load_memory(self) -> None:
         if self._memory_path.exists():
             try:
@@ -172,16 +166,9 @@ class Orchestrator:
         })
         self._save_memory()
 
-    # ------------------------------------------------------------------ #
-    # Управление агентами-подпроцессами
-    # ------------------------------------------------------------------ #
     def start_agent(self, name: str, script_path: str | Path,
                      args: Optional[list[str]] = None) -> AgentHandle:
-        """Запустить агента как подпроцесс.
-
-        Агент — любой исполняемый скрипт (по умолчанию python),
-        который читает JSON-строки из stdin и пишет JSON-строки в stdout.
-        """
+        """Запустить агента как подпроцесс."""
         script_path = Path(script_path)
         cmd = [sys.executable, str(script_path)] + (args or [])
 
@@ -209,15 +196,8 @@ class Orchestrator:
         for name in list(self.agents.keys()):
             self.stop_agent(name)
 
-    # ------------------------------------------------------------------ #
-    # Приём пользовательского ввода
-    # ------------------------------------------------------------------ #
-    def handle_user_input(self, text: str, timeout: float = 15.0) -> dict:
-        """Принять ввод пользователя и передать его первому агенту в цепочке.
-
-        Возвращает ответ агента (dict) либо служебное сообщение об ошибке,
-        если агентов нет или они не отвечают.
-        """
+    def handle_user_input(self, text: str, timeout: float = 15.0, parse_as_spec: bool = False) -> dict:
+        """Принять ввод пользователя и передать его первому агенту в цепочке."""
         self.logger.info("Получен ввод пользователя: %s", text)
         self.append_history("user", text)
 
@@ -241,24 +221,44 @@ class Orchestrator:
             return {"error": "agent_timeout", "agent": first_agent_name}
 
         self.append_history(first_agent_name, json.dumps(response, ensure_ascii=False))
+
+        # Валидация структурированного ТЗ — только если её явно запросили
+        # (например, через run_analyst_spec.py). В обычном диалоговом режиме
+        # агент отвечает свободным текстом, без принудительного JSON.
+        if parse_as_spec and "text" in response:
+            self._handle_analyst_response(response)
+
         return response
 
-    # ------------------------------------------------------------------ #
-    # Работа с Ollama через REST API
-    # ------------------------------------------------------------------ #
+    def _handle_analyst_response(self, response: dict) -> None:
+        """Валидирует ответ агента-аналитика и сохраняет ТЗ в общую память."""
+        raw_text = response.get("text", "")
+        is_valid, spec, errors = validate_llm_response(raw_text, self.logs_dir)
+
+        response["parsed_spec"] = spec
+        response["validation_errors"] = errors
+
+        if is_valid:
+            self.remember("last_tech_spec", spec)
+            self.logger.info("Аналитик подготовил валидное ТЗ: %s", spec.get("title"))
+            print(
+                f"✅ Аналитик подготовил ТЗ «{spec.get('title')}» "
+                f"({len(spec.get('requirements', []))} требований, "
+                f"{len(spec.get('modules', []))} модулей)"
+            )
+        else:
+            self.logger.warning("Невалидный ответ агента-аналитика: %s", errors)
+            print(f"❌ Ответ Аналитика не прошёл валидацию: {errors}")
+
     def query_ollama(
         self,
         prompt: str,
-        model: str = "llama3",
+        model: str = "qwen2.5-coder:3b",
         system: Optional[str] = None,
         stream: bool = False,
         timeout: float = 60.0,
     ) -> str:
-        """Отправить запрос модели в Ollama (эндпоинт /api/generate).
-
-        Возвращает текст ответа модели (строку). Если Ollama недоступна —
-        кидает исключение, чтобы вызывающий код мог обработать ошибку.
-        """
+        """Отправить запрос модели в Ollama (эндпоинт /api/generate)."""
         url = f"{self.ollama_host}/api/generate"
         payload: dict[str, Any] = {
             "model": model,
@@ -304,9 +304,6 @@ class Orchestrator:
         data = resp.json()
         return [m["name"] for m in data.get("models", [])]
 
-    # ------------------------------------------------------------------ #
-    # Корректное завершение работы
-    # ------------------------------------------------------------------ #
     def shutdown(self) -> None:
         self.logger.info("Завершение работы оркестратора...")
         self.stop_all_agents()
