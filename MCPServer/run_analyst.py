@@ -8,6 +8,17 @@ from core.orchestrator import Orchestrator  # noqa: E402
 
 EXIT_COMMANDS = {"exit", "quit", "выход"}
 
+# Ключевые слова, по которым мы сами (на уровне кода, а не надеясь на
+# модель) включаем строгий режим ТЗ с валидацией и автозапуском
+# агента-разработчика — это надёжнее, чем полагаться на то, что любая
+# модель аккуратно соблюдёт инструкцию из системного промпта.
+SPEC_TRIGGERS = ("тз", "техническое задание", "план проекта")
+
+
+def wants_spec(user_text: str) -> bool:
+    text = user_text.lower()
+    return any(trigger in text for trigger in SPEC_TRIGGERS)
+
 
 def main() -> None:
     orch = Orchestrator(
@@ -35,10 +46,17 @@ def main() -> None:
             if user_text.lower() in EXIT_COMMANDS:
                 break
 
-            response = orch.handle_user_input(user_text, timeout=300.0)
+            parse_as_spec = wants_spec(user_text)
+            response = orch.handle_user_input(user_text, timeout=300.0, parse_as_spec=parse_as_spec)
 
             if response.get("error") == "agent_timeout":
                 print("\n⏱ Агент не ответил за отведённое время. Попробуй ещё раз.\n")
+                continue
+
+            if parse_as_spec and response.get("parsed_spec") is not None:
+                # Статус (✅/❌) и результат разработчика уже напечатаны
+                # самим оркестратором — не дублируем сырой JSON в чате.
+                print()
                 continue
 
             print(f"Агент: {response.get('text', response)}\n")

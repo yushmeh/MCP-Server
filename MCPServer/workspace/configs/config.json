@@ -13,6 +13,11 @@
       "script": "agents/analyst.py",
       "role": "analyst",
       "enabled": true
+    },
+    "developer": {
+      "script": "agents/developer.py",
+      "role": "developer",
+      "enabled": true
     }
   },
   "orchestrator": {

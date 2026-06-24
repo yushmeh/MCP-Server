@@ -12,6 +12,28 @@ REQUIRED_FIELDS = ["title", "description", "requirements", "modules"]
 # Поля, которые обязательно должны быть списками строк, если присутствуют.
 LIST_FIELDS = ["requirements", "modules", "tech_stack"]
 
+# Модели иногда переводят названия полей на русский, несмотря на явную
+# инструкцию использовать английские ключи. Это нормализует такие
+# варианты в нашу схему, прежде чем проверять обязательные поля.
+FIELD_ALIASES = {
+    "название": "title", "название проекта": "title", "заголовок": "title",
+    "описание": "description", "описание задачи": "description",
+    "требования": "requirements", "требование": "requirements",
+    "модули": "modules", "модуль": "modules",
+    "стек": "tech_stack", "технологии": "tech_stack", "технологический стек": "tech_stack",
+    "файлы": "files", "файл": "files",
+}
+
+
+def _normalize_keys(data: dict) -> dict:
+    """Переводит русские варианты названий полей в ожидаемые английские,
+    если модель проигнорировала инструкцию использовать английские ключи."""
+    normalized = {}
+    for key, value in data.items():
+        normalized_key = FIELD_ALIASES.get(key.strip().lower(), key)
+        normalized[normalized_key] = value
+    return normalized
+
 
 def _extract_json_block(raw_text: str) -> Optional[str]:
     """Достаёт JSON-объект из текста ответа модели."""
@@ -52,6 +74,8 @@ def validate_llm_response(
         _log_invalid(raw_text, errors, logs_dir)
         return False, None, errors
 
+    data = _normalize_keys(data)
+
     for field in REQUIRED_FIELDS:
         if field not in data:
             errors.append(f"Отсутствует обязательное поле: '{field}'")
@@ -59,6 +83,16 @@ def validate_llm_response(
     for field in LIST_FIELDS:
         if field in data and not isinstance(data[field], list):
             errors.append(f"Поле '{field}' должно быть списком строк")
+
+    # Поле "files" опционально, но если оно есть — это список объектов
+    # с обязательным "path" (нужен агенту-разработчику для генерации кода).
+    if "files" in data:
+        if not isinstance(data["files"], list):
+            errors.append("Поле 'files' должно быть списком объектов {path, description}")
+        else:
+            for i, item in enumerate(data["files"]):
+                if not isinstance(item, dict) or "path" not in item:
+                    errors.append(f"files[{i}] должен быть объектом с полем 'path'")
 
     if errors:
         _log_invalid(raw_text, errors, logs_dir)

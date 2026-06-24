@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import queue
 import subprocess
 import sys
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
@@ -172,6 +174,9 @@ class Orchestrator:
         script_path = Path(script_path)
         cmd = [sys.executable, str(script_path)] + (args or [])
 
+        env = os.environ.copy()
+        env["PYTHONIOENCODING"] = "utf-8"
+
         self.logger.info("Запуск агента '%s': %s", name, " ".join(cmd))
         process = subprocess.Popen(
             cmd,
@@ -179,7 +184,10 @@ class Orchestrator:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             bufsize=1,  # построчная буферизация
+            env=env,
         )
         handle = AgentHandle(name, process)
         self.agents[name] = handle
@@ -212,6 +220,7 @@ class Orchestrator:
             "type": "user_input",
             "text": text,
             "memory_snapshot": self.memory.get("history", [])[-10:],
+            "want_spec": parse_as_spec,
         }
         handle.send(message)
 
@@ -246,9 +255,80 @@ class Orchestrator:
                 f"({len(spec.get('requirements', []))} требований, "
                 f"{len(spec.get('modules', []))} модулей)"
             )
+            self._trigger_developer(spec)
         else:
             self.logger.warning("Невалидный ответ агента-аналитика: %s", errors)
             print(f"❌ Ответ Аналитика не прошёл валидацию: {errors}")
+            preview = raw_text.strip()[:500]
+            print(f"   Сырой ответ модели (первые 500 символов):\n   {preview}")
+
+    def _trigger_developer(self, spec: dict) -> None:
+        """Запускает (если ещё не запущен) агента-разработчика и передаёт
+        ему готовое ТЗ для генерации кода."""
+        agent_name = "developer"
+        developer_script = self.workspace_dir.parent / "agents" / "developer.py"
+
+        if agent_name not in self.agents or not self.agents[agent_name].is_alive():
+            if not developer_script.exists():
+                self.logger.warning("Скрипт агента-разработчика не найден: %s", developer_script)
+                print(f"⚠️ Не найден агент-разработчик: {developer_script}")
+                return
+            self.start_agent(agent_name, developer_script)
+            time.sleep(0.3)  # даём подпроцессу подняться
+
+        print(f"🛠 Запускаю агента-разработчика для «{spec.get('title')}»...")
+        handle = self.agents[agent_name]
+        handle.send({"type": "build_request", "spec": spec})
+
+        # Таймаут зависит от количества файлов: на медленном железе без
+        # GPU каждый файл может генерироваться по 1-2 минуты, поэтому
+        # фиксированных 300 секунд может не хватить уже на 3-4 файла.
+        files_count = max(1, len(spec.get("files", [])))
+        dev_timeout = max(300.0, files_count * 150.0)
+        print(f"   (жду ответа разработчика до {int(dev_timeout)} сек на {files_count} файлов)")
+
+        dev_response = handle.receive(timeout=dev_timeout)
+        if dev_response is None:
+            self.logger.error("Агент-разработчик не ответил за отведённое время")
+            print("❌ Агент-разработчик не ответил за отведённое время")
+            self._report_partial_project(spec)
+            return
+
+        self.remember("last_generated_project", dev_response)
+
+        files_written = dev_response.get("files_written", [])
+        errors = dev_response.get("errors", [])
+        project_dir = dev_response.get("project_dir", "")
+
+        self.logger.info(
+            "Разработчик завершил работу: %s файлов записано, %s ошибок",
+            len(files_written), len(errors),
+        )
+
+        if files_written:
+            print(f"✅ Сгенерировано {len(files_written)} файлов в workspace/projects/{project_dir}/")
+            for f in files_written:
+                print(f"   • {f}")
+        if errors:
+            print(f"⚠️ Ошибки при генерации некоторых файлов: {errors}")
+        if not files_written and not errors:
+            print(f"⚠️ Разработчик не вернул результат: {dev_response}")
+
+    def _report_partial_project(self, spec: dict) -> None:
+        try:
+            from agents.developer import slugify
+            project_dir_guess = slugify(spec.get("title", "project"))
+            project_path = self.workspace_dir / "projects" / project_dir_guess
+            if project_path.exists():
+                existing_files = sorted(
+                    str(p.relative_to(project_path))
+                    for p in project_path.rglob("*") if p.is_file()
+                )
+                if existing_files:
+                    print(f"   ⏳ Разработчик может ещё работать в фоне. Уже записано: {existing_files}")
+                    print(f"   Проверь папку через минуту-две: {project_path}")
+        except Exception:
+            pass
 
     def query_ollama(
         self,

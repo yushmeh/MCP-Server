@@ -25,7 +25,12 @@ def load_config() -> dict:
 
 
 def call_ollama(
-    system_prompt: str, user_text: str, host: str, model: str, timeout: float = 280.0
+    system_prompt: str,
+    user_text: str,
+    host: str,
+    model: str,
+    timeout: float = 280.0,
+    force_json: bool = False,
 ) -> str:
     """Запрос к Ollama через REST API (/api/generate)."""
     url = f"{host.rstrip('/')}/api/generate"
@@ -35,6 +40,9 @@ def call_ollama(
         "system": system_prompt,
         "stream": False,
     }
+    if force_json:
+        payload["format"] = "json"
+
     response = requests.post(url, json=payload, timeout=timeout)
     response.raise_for_status()
     data = response.json()
@@ -70,9 +78,10 @@ def main() -> None:
             break
 
         user_text = message.get("text", "")
+        want_spec = message.get("want_spec", False)
 
         try:
-            llm_text = call_ollama(system_prompt, user_text, host, model)
+            llm_text = call_ollama(system_prompt, user_text, host, model, force_json=want_spec)
             response = {
                 "type": "agent_response",
                 "agent": "analyst",
