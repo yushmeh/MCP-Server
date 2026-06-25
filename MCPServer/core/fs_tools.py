@@ -70,10 +70,7 @@ def create_directory(relative_path: str) -> Path:
 
 def write_file(relative_path: str, content: str) -> Path:
     """Записывает файл внутри workspace/projects, создавая родительские
-    директории при необходимости.
-
-    :raises PathEscapeError: если путь выходит за пределы workspace/projects.
-    """
+    директории при необходимости."""
     try:
         target = _resolve_safe(relative_path)
         target.parent.mkdir(parents=True, exist_ok=True)

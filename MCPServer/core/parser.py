@@ -1,13 +1,3 @@
-"""
-parser.py — парсер и валидатор структурированных ответов LLM.
-
-Используется ядром (Orchestrator) для проверки того, что ответ
-агента-аналитика — это валидный JSON с обязательным набором полей
-технического задания (ТЗ). Если ответ невалиден, он логируется в
-отдельный файл в logs/, чтобы можно было разобрать, почему модель
-не справилась с форматом.
-"""
-
 from __future__ import annotations
 
 import json
@@ -46,11 +36,7 @@ def _normalize_keys(data: dict) -> dict:
 
 
 def _extract_json_block(raw_text: str) -> Optional[str]:
-    """Достаёт JSON-объект из текста ответа модели.
-
-    Модель иногда оборачивает JSON в markdown-блок ```json ... ```
-    или добавляет пояснения до/после — пытаемся вытащить именно объект.
-    """
+    """Достаёт JSON-объект из текста ответа модели."""
     md_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", raw_text, re.DOTALL)
     if md_match:
         return md_match.group(1)
@@ -65,12 +51,7 @@ def _extract_json_block(raw_text: str) -> Optional[str]:
 def validate_llm_response(
     raw_text: str, logs_dir: str | Path
 ) -> Tuple[bool, Optional[dict], list[str]]:
-    """Проверяет ответ LLM на соответствие JSON-схеме ТЗ.
-
-    :param raw_text: необработанный текстовый ответ модели (или агента).
-    :param logs_dir: директория, в которую пишется лог невалидных ответов.
-    :return: (is_valid, parsed_dict_или_None, список_ошибок)
-    """
+    """Проверяет ответ LLM на соответствие JSON-схеме ТЗ."""
     errors: list[str] = []
     logs_dir = Path(logs_dir)
     logs_dir.mkdir(parents=True, exist_ok=True)

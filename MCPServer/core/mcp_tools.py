@@ -70,13 +70,7 @@ def _parse_pytest_summary(output: str) -> dict:
 
 
 def run_pytest(project_dir: str, timeout: float = 180.0) -> dict:
-    """Запускает pytest для сгенерированного проекта и возвращает разбор результата.
-
-    :param project_dir: имя папки внутри workspace/projects/ (например,
-        "telegram_bot_napominaniy").
-    :return: словарь с returncode, raw_output (хвост вывода) и разбором
-        passed/failed/collection_errors/summary_line.
-    """
+    """Запускает pytest для сгенерированного проекта и возвращает разбор результата."""
     project_path = WORKSPACE_ROOT / project_dir
     if not project_path.exists():
         detail = f"Папка проекта не найдена: {project_path}"

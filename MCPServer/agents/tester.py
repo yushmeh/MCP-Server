@@ -1,20 +1,3 @@
-"""
-tester.py — агент-тестировщик.
-
-Принимает информацию о только что сгенерированном проекте (папка и
-список файлов от агента-разработчика), для каждого Python-файла
-генерирует юнит-тесты через Ollama, записывает их в <project>/tests/ и
-запускает pytest через core/mcp_tools.py, возвращая оркестратору
-статус выполнения (сколько тестов прошло/упало).
-
-Протокол общения с ядром:
-вход (stdin):  {"type": "test_request", "project_dir": "...",
-                 "files_written": [...], "spec": {...} | не указано}
-выход (stdout): {"type": "agent_response", "agent": "tester",
-                  "project_dir": "...", "tests_written": [...],
-                  "passed": N, "failed": M, "errors": [...], "raw_output": "..."}
-"""
-
 import json
 import re
 import sys
