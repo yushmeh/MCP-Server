@@ -18,6 +18,11 @@
       "script": "agents/developer.py",
       "role": "developer",
       "enabled": true
+    },
+    "tester": {
+      "script": "agents/tester.py",
+      "role": "tester",
+      "enabled": true
     }
   },
   "orchestrator": {

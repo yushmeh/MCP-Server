@@ -1,3 +1,23 @@
+"""
+developer.py — агент-разработчик.
+
+Принимает структурированное ТЗ (то же, что готовит агент-аналитик в
+режиме ТЗ — см. workspace/prompts/analyst.md) и генерирует код для
+каждого файла из списка "files" в ТЗ, используя Ollama. Готовые файлы
+записываются в workspace/projects/<slug-проекта>/ через безопасные
+инструменты файловой системы (core/fs_tools.py).
+
+ТЗ может прийти двумя способами:
+1. В самом сообщении от оркестратора: {"type": "build_request", "spec": {...}}
+2. Если поле "spec" не передано — агент сам читает workspace/memory.json
+   и берёт оттуда ключ "last_tech_spec" (общая память оркестратора).
+
+Протокол общения с ядром:
+вход (stdin):  {"type": "build_request", "spec": {...} | не указано}
+выход (stdout): {"type": "agent_response", "agent": "developer",
+                  "project_dir": "...", "files_written": [...], "errors": [...]}
+"""
+
 import json
 import re
 import sys
@@ -98,9 +118,14 @@ def call_ollama(
     return data.get("response", "")
 
 
-def build_file_prompt(spec: dict, file_entry: dict) -> str:
-    """Формирует промпт для генерации ОДНОГО конкретного файла."""
-    return (
+def build_file_prompt(spec: dict, file_entry: dict, fix_context: str | None = None) -> str:
+    """Формирует промпт для генерации ОДНОГО конкретного файла.
+
+    :param fix_context: если передан — это отчёт о падении тестов
+        (вывод pytest), который добавляется к промпту с просьбой
+        исправить код так, чтобы тесты проходили.
+    """
+    prompt = (
         f"Проект: {spec.get('title', '')}\n"
         f"Описание: {spec.get('description', '')}\n"
         f"Требования: {', '.join(spec.get('requirements', []))}\n"
@@ -108,26 +133,55 @@ def build_file_prompt(spec: dict, file_entry: dict) -> str:
         f"Сгенерируй содержимое файла: {file_entry.get('path')}\n"
         f"Назначение файла: {file_entry.get('description', '')}"
     )
+    if fix_context:
+        prompt += (
+            "\n\nВНИМАНИЕ: предыдущая версия этого файла (или связанного с ним "
+            "кода в проекте) не прошла автоматические тесты. Вот вывод тестов:\n"
+            f"{fix_context}\n\n"
+            "Исправь код этого файла так, чтобы устранить причину падения "
+            "тестов, сохранив остальную функциональность и не убирая нужные "
+            "элементы (импорты, функции), если они не являются причиной ошибки."
+        )
+    return prompt
 
 
-def process_build_request(spec: dict, host: str, model: str, system_prompt: str) -> dict:
-    """Итерируется по списку файлов из ТЗ, генерирует и записывает каждый."""
+def process_build_request(
+    spec: dict,
+    host: str,
+    model: str,
+    system_prompt: str,
+    existing_project_dir: str | None = None,
+    fix_context: str | None = None,
+) -> dict:
+    """Итерируется по списку файлов из ТЗ, генерирует и записывает каждый.
+
+    :param existing_project_dir: если передан — генерация идёт в УЖЕ
+        существующую папку проекта (режим исправления по отчёту
+        тестировщика), без создания новой папки и без защиты от
+        перезатирания (мы здесь сознательно перезаписываем файлы).
+    :param fix_context: отчёт о падении тестов, передаётся в промпт
+        каждого файла (см. build_file_prompt).
+    """
     files = spec.get("files") or []
     if not files:
         # Резерв: если ТЗ не содержит явного списка файлов — генерируем
         # один main.py по общему описанию, чтобы пайплайн не падал.
         files = [{"path": "main.py", "description": spec.get("description", "")}]
 
-    project_dir = slugify(spec.get("title", "project"))
+    if existing_project_dir:
+        project_dir = existing_project_dir
+        create_directory(project_dir)
+    else:
+        project_dir = slugify(spec.get("title", "project"))
 
-    # Защита от перезатирания: если папка с таким именем уже существует
-    # и не пуста — добавляем суффикс с таймстампом, чтобы не потерять
-    # результаты предыдущего запуска.
-    existing = (PROJECT_ROOT / "workspace" / "projects" / project_dir)
-    if existing.exists() and any(existing.iterdir()):
-        project_dir = f"{project_dir}_{datetime.now():%Y%m%d_%H%M%S}"
+        # Защита от перезатирания: если папка с таким именем уже существует
+        # и не пуста — добавляем суффикс с таймстампом, чтобы не потерять
+        # результаты предыдущего запуска.
+        existing = (PROJECT_ROOT / "workspace" / "projects" / project_dir)
+        if existing.exists() and any(existing.iterdir()):
+            project_dir = f"{project_dir}_{datetime.now():%Y%m%d_%H%M%S}"
 
-    create_directory(project_dir)
+        create_directory(project_dir)
 
     written: list[str] = []
     errors: list[str] = []
@@ -139,7 +193,7 @@ def process_build_request(spec: dict, host: str, model: str, system_prompt: str)
             continue
 
         full_relative_path = f"{project_dir}/{file_path}"
-        prompt = build_file_prompt(spec, file_entry)
+        prompt = build_file_prompt(spec, file_entry, fix_context=fix_context)
 
         try:
             raw_response = call_ollama(system_prompt, prompt, host, model)
@@ -201,10 +255,34 @@ def main() -> None:
             print(json.dumps(response, ensure_ascii=False), flush=True)
             continue
 
-        print(f"[developer] получено ТЗ «{spec.get('title')}», файлов: {len(spec.get('files', []))}",
-              file=sys.stderr, flush=True)
+        message_type = message.get("type")
 
-        result = process_build_request(spec, host, model, system_prompt)
+        if message_type == "fix_request":
+            project_dir = message.get("project_dir")
+            test_report = message.get("test_report", {})
+            fix_context = (
+                f"Пройдено: {test_report.get('passed', 0)}, "
+                f"Упало: {test_report.get('failed', 0)}\n"
+                f"Ошибки генерации тестов: {test_report.get('errors', [])}\n"
+                f"Вывод pytest:\n{test_report.get('raw_output', '')}"
+            )
+            print(
+                f"[developer] получен запрос на исправление проекта «{project_dir}» "
+                f"(упало тестов: {test_report.get('failed', 0)})",
+                file=sys.stderr, flush=True,
+            )
+            result = process_build_request(
+                spec, host, model, system_prompt,
+                existing_project_dir=project_dir,
+                fix_context=fix_context,
+            )
+        else:
+            print(
+                f"[developer] получено ТЗ «{spec.get('title')}», файлов: {len(spec.get('files', []))}",
+                file=sys.stderr, flush=True,
+            )
+            result = process_build_request(spec, host, model, system_prompt)
+
         response = {
             "type": "agent_response",
             "agent": "developer",

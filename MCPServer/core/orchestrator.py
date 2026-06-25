@@ -255,47 +255,85 @@ class Orchestrator:
                 f"({len(spec.get('requirements', []))} требований, "
                 f"{len(spec.get('modules', []))} модулей)"
             )
-            self._trigger_developer(spec)
+            self._run_pipeline(spec)
         else:
             self.logger.warning("Невалидный ответ агента-аналитика: %s", errors)
             print(f"❌ Ответ Аналитика не прошёл валидацию: {errors}")
             preview = raw_text.strip()[:500]
             print(f"   Сырой ответ модели (первые 500 символов):\n   {preview}")
 
-    def _trigger_developer(self, spec: dict) -> None:
-        """Запускает (если ещё не запущен) агента-разработчика и передаёт
-        ему готовое ТЗ для генерации кода."""
-        agent_name = "developer"
-        developer_script = self.workspace_dir.parent / "agents" / "developer.py"
-
+    def _ensure_agent_running(self, agent_name: str, script_filename: str) -> Optional[AgentHandle]:
         if agent_name not in self.agents or not self.agents[agent_name].is_alive():
-            if not developer_script.exists():
-                self.logger.warning("Скрипт агента-разработчика не найден: %s", developer_script)
-                print(f"⚠️ Не найден агент-разработчик: {developer_script}")
-                return
-            self.start_agent(agent_name, developer_script)
+            script_path = self.workspace_dir.parent / "agents" / script_filename
+            if not script_path.exists():
+                self.logger.warning("Скрипт агента '%s' не найден: %s", agent_name, script_path)
+                print(f"⚠️ Не найден агент '{agent_name}': {script_path}")
+                return None
+            self.start_agent(agent_name, script_path)
             time.sleep(0.3)  # даём подпроцессу подняться
+        return self.agents[agent_name]
 
-        print(f"🛠 Запускаю агента-разработчика для «{spec.get('title')}»...")
-        handle = self.agents[agent_name]
+    @staticmethod
+    def _scale_timeout(files_count: int, base: float = 300.0, per_file: float = 150.0) -> float:
+        return max(base, max(1, files_count) * per_file)
+
+    def _trigger_developer(self, spec: dict) -> Optional[dict]:
+        handle = self._ensure_agent_running("developer", "developer.py")
+        if handle is None:
+            return None
+
+        files_count = len(spec.get("files", []))
+        timeout = self._scale_timeout(files_count)
+        print(f"   (жду ответа разработчика до {int(timeout)} сек на {max(1, files_count)} файлов)")
+
         handle.send({"type": "build_request", "spec": spec})
+        return handle.receive(timeout=timeout)
 
-        # Таймаут зависит от количества файлов: на медленном железе без
-        # GPU каждый файл может генерироваться по 1-2 минуты, поэтому
-        # фиксированных 300 секунд может не хватить уже на 3-4 файла.
-        files_count = max(1, len(spec.get("files", [])))
-        dev_timeout = max(300.0, files_count * 150.0)
-        print(f"   (жду ответа разработчика до {int(dev_timeout)} сек на {files_count} файлов)")
+    def _trigger_developer_fix(self, spec: dict, project_dir: str, test_report: dict) -> Optional[dict]:
+        """Отправляет разработчику отчёт о падении тестов с просьбой
+        исправить код в той же папке проекта (без создания новой)."""
+        handle = self._ensure_agent_running("developer", "developer.py")
+        if handle is None:
+            return None
 
-        dev_response = handle.receive(timeout=dev_timeout)
-        if dev_response is None:
-            self.logger.error("Агент-разработчик не ответил за отведённое время")
-            print("❌ Агент-разработчик не ответил за отведённое время")
-            self._report_partial_project(spec)
-            return
+        files_count = len(spec.get("files", []))
+        timeout = self._scale_timeout(files_count)
+        print(f"   (жду ответа разработчика на исправление до {int(timeout)} сек)")
 
-        self.remember("last_generated_project", dev_response)
+        handle.send({
+            "type": "fix_request",
+            "spec": spec,
+            "project_dir": project_dir,
+            "test_report": {
+                "passed": test_report.get("passed", 0),
+                "failed": test_report.get("failed", 0),
+                "errors": test_report.get("errors", []),
+                "raw_output": (test_report.get("raw_output") or "")[:3000],
+            },
+        })
+        return handle.receive(timeout=timeout)
 
+    def _trigger_tester(self, project_dir: str, files_written: list[str], spec: dict) -> Optional[dict]:
+        """Отправляет агенту-тестировщику запрос на генерацию и прогон
+        юнит-тестов для уже сгенерированного проекта."""
+        handle = self._ensure_agent_running("tester", "tester.py")
+        if handle is None:
+            return None
+
+        py_files = [f for f in files_written if f.endswith(".py")]
+        timeout = self._scale_timeout(len(py_files), base=300.0, per_file=150.0)
+        print(f"   (жду ответа тестировщика до {int(timeout)} сек на {max(1, len(py_files))} файлов)")
+
+        handle.send({
+            "type": "test_request",
+            "project_dir": project_dir,
+            "files_written": files_written,
+            "spec": spec,
+        })
+        return handle.receive(timeout=timeout)
+
+    def _print_dev_result(self, dev_response: dict) -> None:
+        """Печатает результат работы разработчика (успех/ошибки файлов)."""
         files_written = dev_response.get("files_written", [])
         errors = dev_response.get("errors", [])
         project_dir = dev_response.get("project_dir", "")
@@ -314,6 +352,82 @@ class Orchestrator:
         if not files_written and not errors:
             print(f"⚠️ Разработчик не вернул результат: {dev_response}")
 
+    def _run_pipeline(self, spec: dict, max_fix_attempts: int = 2) -> None:
+        print(f"🛠 Запускаю агента-разработчика для «{spec.get('title')}»...")
+        dev_response = self._trigger_developer(spec)
+        if dev_response is None:
+            self.logger.error("Агент-разработчик не ответил за отведённое время")
+            print("❌ Агент-разработчик не ответил за отведённое время")
+            self._report_partial_project(spec)
+            return
+
+        self.remember("last_generated_project", dev_response)
+        self._print_dev_result(dev_response)
+
+        project_dir = dev_response.get("project_dir", "")
+        files_written = dev_response.get("files_written", [])
+        if not files_written:
+            print("⚠️ Нет сгенерированных файлов — пропускаю запуск тестировщика.")
+            return
+
+        attempt = 0
+        while True:
+            print(f"🧪 Запускаю агента-тестировщика для «{project_dir}»...")
+            test_response = self._trigger_tester(project_dir, files_written, spec)
+
+            if test_response is None:
+                self.logger.error("Агент-тестировщик не ответил за отведённое время")
+                print("❌ Агент-тестировщик не ответил за отведённое время")
+                self._report_partial_tests(project_dir)
+                return
+
+            self.remember("last_test_report", test_response)
+
+            if test_response.get("error"):
+                print(f"⚠️ Тестировщик сообщил об ошибке: {test_response.get('text', test_response['error'])}")
+                return
+
+            passed = test_response.get("passed", 0)
+            failed = test_response.get("failed", 0)
+            gen_errors = test_response.get("errors", [])
+
+            self.logger.info(
+                "Тестировщик завершил прогон: %s пройдено, %s упало", passed, failed
+            )
+            print(f"   Результат тестов: {passed} пройдено, {failed} упало")
+            if gen_errors:
+                print(f"   ⚠️ Ошибки при генерации тестов: {gen_errors}")
+
+            if failed == 0:
+                print(f"✅ Все тесты прошли успешно для «{project_dir}». Задача завершена.")
+                return
+
+            attempt += 1
+            if attempt > max_fix_attempts:
+                print(
+                    f"❌ Тесты всё ещё падают после {max_fix_attempts} попыток(и) исправления. "
+                    "Останавливаюсь — нужна ручная проверка."
+                )
+                preview = (test_response.get("raw_output") or "").strip()[:500]
+                if preview:
+                    print(f"   Последний вывод pytest (превью):\n   {preview}")
+                return
+
+            print(
+                f"🔁 Тесты упали ({failed}). Передаю отчёт об ошибке разработчику "
+                f"с запросом «исправь ошибку» (попытка {attempt}/{max_fix_attempts})..."
+            )
+            fix_response = self._trigger_developer_fix(spec, project_dir, test_response)
+            if fix_response is None:
+                self.logger.error("Разработчик не ответил на запрос исправления")
+                print("❌ Разработчик не ответил на запрос исправления")
+                return
+
+            self.remember("last_generated_project", fix_response)
+            self._print_dev_result(fix_response)
+            files_written = fix_response.get("files_written") or files_written
+            # цикл повторяется: снова прогоняем тестировщика на исправленном коде
+
     def _report_partial_project(self, spec: dict) -> None:
         try:
             from agents.developer import slugify
@@ -327,6 +441,19 @@ class Orchestrator:
                 if existing_files:
                     print(f"   ⏳ Разработчик может ещё работать в фоне. Уже записано: {existing_files}")
                     print(f"   Проверь папку через минуту-две: {project_path}")
+        except Exception:
+            pass
+
+    def _report_partial_tests(self, project_dir: str) -> None:
+        try:
+            tests_path = self.workspace_dir / "projects" / project_dir / "tests"
+            if tests_path.exists():
+                existing_tests = sorted(
+                    str(p.relative_to(tests_path)) for p in tests_path.glob("*.py")
+                )
+                if existing_tests:
+                    print(f"   ⏳ Тестировщик может ещё работать в фоне. Уже записано тестов: {existing_tests}")
+                    print(f"   Проверь папку через минуту-две: {tests_path}")
         except Exception:
             pass
 
